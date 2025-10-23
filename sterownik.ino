@@ -1,3 +1,12 @@
+/**********************************
+
+SA JAKIES POWAZNE PROBLEMY Z SYNCHRONIZACJA, JAK NA RAZIE DZIALA ALE TAK LEDWO, NA PEWNO BEDZIE POTRZEBNY SZYBSZY PRZETWORNIK TERMOPAROWY
+JAKBY ZROBIC KRZYWE SYSTEMOWE ODPOWIEDNIO TO PEWNIEBY I ODPALIL SILNIK
+Z RACJI NA TO ZMIENIAM WERSJE NA ALFA_1.0
+
+**********************************/
+
+
 #include <ESP32Servo.h>
 #include <Arduino.h>
 #include "SD.h"
@@ -7,14 +16,13 @@
 #include <stdio.h>
 #include <LiquidCrystal_I2C.h>
 #include <driver/ledc.h>
-#include "max6675.h"
 #include <Wire.h>
 
 /*
 PO POWAŻNIEJSZYCH ZMIANACH ZMIENIC NUMER WERSJI PONIŻEJ
 */
 
-const char *wersja = "alfa_preview_barebones";
+const char *wersja = "alfa_1.0";
 
 /*
 DO SPRAWDZENIA PINY SPI I EWENTUALNA ZMIANA WSKAZNIKOW ALBO INNYCH PINOW FUNKCJONALNYCH
@@ -22,7 +30,7 @@ DO SPRAWDZENIA PINY SPI I EWENTUALNA ZMIANA WSKAZNIKOW ALBO INNYCH PINOW FUNKCJO
 
 int thermoDO = 19;
 int thermoCS = 23;
-int thermoCLK = 18;
+int thermoCLK = 5;
 
 int starter = 25;
 int zaplon = 33;
@@ -32,7 +40,7 @@ int overtemp = 12;
 int pin_pot = 35;
 int uzbrojony = 15;  //TO MUSI BYC PRZELACZNIK A NIE PRZYCISK, NAJLEPIEJ W ODDZIELNYM PUDELKU ODDALONYM OD GLOWNEGO STEROWNIKA
 
-float temp = 0;
+float temp = NAN;
 int rpm = 0;
 int stan_dzialania = 0;
 //piny do sterowania menu
@@ -40,7 +48,7 @@ int stan_dzialania = 0;
 int menu_gora = 16;
 int menu_dol = 17;
 int menu_lewo = 14;
-int menu_prawo = 5;
+int menu_prawo = 26;
 
 /*
 PINY DO KARTY SD
@@ -67,11 +75,48 @@ int liczba_probek = 4095;  //TU BEDZIE DO ZMIANY JAK NIC
 int FSM_state = 0; //kontrolka do glownego FSMa, pewnie bedzie do zmiany na taska z FSMem w srodku
 
 LiquidCrystal_I2C lcd(0x27, lcd_kolumny, lcd_rzedy);
-MAX6675 thermocouple(thermoCS, thermoDO, thermoCLK);
+
+TaskHandle_t handleOdczytTemperatur = NULL;
+TaskHandle_t handleReczneSterowanie = NULL;
+
+QueueHandle_t handleTemperatury = NULL;
+QueueHandle_t handleTemperaturyEkran = NULL;
+
+SemaphoreHandle_t spiMutex;
+
+SPIClass spiMAX6675(VSPI);
+
+float readMAX6675() {
+  uint16_t v;
+
+  digitalWrite(thermoCS, LOW);
+  delayMicroseconds(2);
+
+  v = spiMAX6675.transfer16(0x00);
+
+  digitalWrite(thermoCS, HIGH);
+
+  if (v & 0x4) {
+    return NAN;  // brak termopary
+  }
+
+  v >>= 3;
+  return v * 0.25;
+}
 
 void ReczneSterowanie(void *parameters) {
+
+  float tempLocalR = 0;
+  float tempLocal = 0;
+
   while (1) {
-    if (digitalRead(sterowanie_reczne) == HIGH && temp <= max_temperatura && digitalRead(uzbrojony) == LOW) {
+  float tempLocalR = NAN;
+  float tempLocal = NAN;
+    if(xQueueReceive(handleTemperatury, &tempLocal, portMAX_DELAY)){
+      tempLocalR = tempLocal;
+    }
+
+    if (digitalRead(sterowanie_reczne) == HIGH && tempLocalR <= max_temperatura && digitalRead(uzbrojony) == LOW) {
 
       int przepustnica = analogRead(pin_pot);
       ledcWrite(wtrysk, przepustnica);
@@ -79,7 +124,7 @@ void ReczneSterowanie(void *parameters) {
       Serial.print(przepustnica * 0.0244140625);  //
       Serial.print("%  |  ");                     //
       Serial.print("Temperatura: ");              // TĄ SEKCJĘ WYWALIĆ NA EKRAN W FINALNEJ WERSJI
-      Serial.print(temp);                         // W FORMIE
+      Serial.print(tempLocalR);                   // W FORMIE
       Serial.print(" C");                         //
       Serial.print("  |  ");                      // RPM: rpm     TEMP: temp
       Serial.print("RPM: ");                      // PRZEP: przepustnica w %
@@ -87,7 +132,7 @@ void ReczneSterowanie(void *parameters) {
       Serial.println("  |");                      // STAN: stan
       vTaskDelay(pdMS_TO_TICKS(200));
     }
-    if (temp >= max_temperatura) {
+    if (tempLocalR >= max_temperatura) {
 
       digitalWrite(sterowanie_reczne, LOW);
       digitalWrite(wtrysk, LOW);
@@ -100,6 +145,7 @@ void ReczneSterowanie(void *parameters) {
       vTaskDelay(pdMS_TO_TICKS(2000)); 
       vTaskDelete(NULL);
     }
+
     if(digitalRead(uzbrojony) == HIGH)
     {
       digitalWrite(sterowanie_reczne,LOW);
@@ -112,8 +158,13 @@ void ReczneSterowanie(void *parameters) {
 
 void OdczytTemperatur(void *parameters) {
   while (1) {
-    SPI.begin();
-    temp = thermocouple.readCelsius();
+    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
+      temp = readMAX6675();
+      xSemaphoreGive(spiMutex);
+    }
+    Serial.print(temp);
+    xQueueSend(handleTemperatury, &temp, portMAX_DELAY);
+    xQueueSend(handleTemperaturyEkran, &temp, portMAX_DELAY);
     rpm = 10000;  //odczyt rpm trzeba dodac pozniej jak sie ogarnie jak to zrobic
     vTaskDelay(pdMS_TO_TICKS(500));
   }
@@ -140,7 +191,7 @@ void SterowanieEkranem(void *parameters) {
           lcd.setCursor(0, 1);
           lcd.print("Projekt Hydrogen");
           lcd.setCursor(0, 2);
-          lcd.print("Wer. alpha barebones");
+          lcd.print(wersja);
           vTaskDelay(pdMS_TO_TICKS(1000));
           break;
 
@@ -241,15 +292,21 @@ void SterowanieEkranem(void *parameters) {
 
     // --- Dynamiczne odświeżanie danych w stanie 8 ---
     if (stan_dzialania == 8) {
+      float tempLocal = 0;
+      float tempLocalR = 0;
       unsigned long now = millis();
       if (now - lastUpdate > 100) { // odśwież co 500 ms
         lastUpdate = now;
 
+        if(xQueueReceive(handleTemperaturyEkran, &tempLocal, portMAX_DELAY)){
+        tempLocalR = tempLocal;
+        }
         // Temperatura
         lcd.setCursor(6, 0);
         lcd.print("     "); // wyczyść poprzednie dane
         lcd.setCursor(6, 0);
-        lcd.print(temp, 1); // 1 miejsce po przecinku
+        lcd.print(tempLocal, 1); // 1 miejsce po przecinku
+        
 
         // RPM
         lcd.setCursor(15, 0);
@@ -267,12 +324,9 @@ void SterowanieEkranem(void *parameters) {
     }
 
     // --- Zwolnij CPU ---
-    vTaskDelay(pdMS_TO_TICKS(20)); // opóźnienie dla płynności
+    vTaskDelay(pdMS_TO_TICKS(500)); // opóźnienie dla płynności
   }
 }
-
-TaskHandle_t handleOdczytTemperatur = NULL;
-TaskHandle_t handleReczneSterowanie = NULL;
 
 void FSMTask(void *pvParameters) {
   while (1) {
@@ -428,8 +482,8 @@ void FSMTask(void *pvParameters) {
 
       case 1: {
         // Tryb ręczny – uruchamiamy taski tylko jeśli nie istnieją
-      xTaskCreate(OdczytTemperatur,"odczTemp",10000, NULL, 2, &handleOdczytTemperatur);
-      xTaskCreate(ReczneSterowanie, "reczSter", 10000, NULL, 2, &handleReczneSterowanie);
+      xTaskCreatePinnedToCore(OdczytTemperatur,"odczTemp",10000, NULL, 2, &handleOdczytTemperatur,0);
+      xTaskCreatePinnedToCore(ReczneSterowanie, "reczSter", 10000, NULL, 2, &handleReczneSterowanie,0);
       }
       break;
 
@@ -449,6 +503,7 @@ void FSMTask(void *pvParameters) {
           ledcWrite(wtrysk, i);
           delay(1);
         }
+        ledcWrite(starter,0);
         stan_dzialania = 11;
         FSM_state = 0;
       }
@@ -464,8 +519,10 @@ void setup() {
   ledcAttach(starter, STARTER_FREQ, 12);
   ledcAttach(zaplon, ZAPLON_FREQ, 12);
 
-  Serial.begin(115200);
 
+
+  Serial.begin(115200);
+ 
   /* WYLACZONE DO TESTOW WSTEPNYCH
   SD.begin(SD_CS);
   if (!SD.begin(SD_CS)) {
@@ -492,14 +549,30 @@ void setup() {
   pinMode(menu_prawo, INPUT_PULLUP);
   pinMode(uzbrojony, INPUT_PULLUP);  // przycisk do masy HIGH-nieklikniety LOW-klikniety
 
+  handleTemperatury = xQueueCreate(5,sizeof(float));
+  if(handleTemperatury == NULL){
+    Serial.println("Kolejka niezainicjalizowana");
+  }
 
-  xTaskCreate(SterowanieEkranem,"ekran",10000,NULL,2,NULL);
+  handleTemperaturyEkran = xQueueCreate(5,sizeof(float));
+  if(handleTemperaturyEkran == NULL){
+    Serial.println("Kolejka ekranowa niezainicjalizowana");
+  }
+
+  pinMode(thermoCS, OUTPUT);
+  digitalWrite(thermoCS, HIGH);
+  spiMAX6675.begin(thermoCLK, thermoDO, -1, thermoCS);
+
+  spiMutex = xSemaphoreCreateMutex();
+
   delay(1000);
-  xTaskCreate(FSMTask,"fsm",20000,NULL,2,NULL);
+
+  xTaskCreatePinnedToCore(SterowanieEkranem,"ekran",10000,NULL,2,NULL,1);
+  xTaskCreatePinnedToCore(FSMTask,"fsm",20000,NULL,2,NULL,1);
+
   Serial.println("Sterownik silnika GTM140");
   Serial.print("Wersja: ");
   Serial.println(wersja);
-  delay(1000);
 
 
   }
